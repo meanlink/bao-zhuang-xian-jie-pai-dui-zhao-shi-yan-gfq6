@@ -34,6 +34,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-pack-welch-development-only}
       SEED_DEMO: ${SEED_DEMO:-true}
       ARTIFACT_DIR: /artifacts
+      UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-8589934592}
     ports: ["${BACKEND_PORT:-19203}:8000"]
     volumes: ["analysis-artifacts:/artifacts"]
     depends_on:

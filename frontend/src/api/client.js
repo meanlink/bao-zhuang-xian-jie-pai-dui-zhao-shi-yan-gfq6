@@ -1,6 +1,8 @@
 import {session} from '../stores/session.js';
 export async function api(path,options={}){
- const r=await fetch('/api'+path,{...options,headers:{'Content-Type':'application/json',...(session.token?{Authorization:'Bearer '+session.token}:{}),...options.headers}});
+ const body=options.body;
+ const binary=body instanceof Blob;
+ const r=await fetch('/api'+path,{...options,headers:{...(binary?{}:{'Content-Type':'application/json'}),...(session.token?{Authorization:'Bearer '+session.token}:{}),...options.headers}});
  if(!r.ok){let d=await r.json().catch(()=>({detail:'连接失败，请稍后重试'}));if(r.status===401&&path!='/auth/login'){session.clear();location.hash='#/login';}throw new Error(typeof d.detail==='string'?d.detail:JSON.stringify(d.detail));}
  return r.json();
 }

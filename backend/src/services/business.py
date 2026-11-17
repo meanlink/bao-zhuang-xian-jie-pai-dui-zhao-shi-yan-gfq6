@@ -25,7 +25,7 @@ def seed_records():
     return rows
 
 
-def analyze(records, params):
+def _validate_params(params):
     try:
         confidence = float(params.get("confidence", .95))
     except (TypeError, ValueError):
@@ -35,6 +35,11 @@ def analyze(records, params):
     shift = str(params.get("shift", "全部"))
     if shift not in ("全部", "早班", "晚班"):
         raise ValueError("未知班次")
+    return confidence, shift
+
+
+def analyze(records, params):
+    confidence, shift = _validate_params(params)
     groups = {"A": [], "B": []}
     seen = set()
     for r in records:
@@ -48,11 +53,39 @@ def analyze(records, params):
                 groups[arm].append(seconds)
         except (KeyError, TypeError, ValueError):
             raise ValueError("片段号须唯一，组别为 A/B，节拍必须为正有限数")
-    if min(map(len, groups.values())) < 3:
+    return _finish(groups, confidence, shift)
+
+
+class Moments:
+    """Welford 在线均值/方差，不保留原始观测。"""
+    __slots__ = ("n", "mean", "m2")
+
+    def __init__(self):
+        self.n = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def add(self, x):
+        self.n += 1
+        delta = x - self.mean
+        self.mean += delta / self.n
+        self.m2 += delta * (x - self.mean)
+
+    @property
+    def var(self):
+        return self.m2 / (self.n - 1) if self.n > 1 else 0.0
+
+
+def _finish(groups, confidence, shift):
+    na, nb = len(groups["A"]), len(groups["B"])
+    if min(na, nb) < 3:
         raise ValueError("每组至少需要 3 个独立实验片段")
     a, b = np.array(groups["A"]), np.array(groups["B"])
-    na, nb = len(a), len(b)
     ma, mb, va, vb = float(a.mean()), float(b.mean()), float(a.var(ddof=1)), float(b.var(ddof=1))
+    return _report(ma, mb, va, vb, na, nb, confidence, shift)
+
+
+def _report(ma, mb, va, vb, na, nb, confidence, shift):
     se2 = va / na + vb / nb
     if se2 <= 1e-15:
         raise ValueError("两组均无变异，Welch 检验无法估计误差")
@@ -64,9 +97,28 @@ def analyze(records, params):
     low, high = diff - margin, diff + margin
     pooled = math.sqrt(((na - 1) * va + (nb - 1) * vb) / (na + nb - 2))
     effect = diff / pooled
-    rows = [{"arm": k, "n": len(groups[k]), "mean": round(float(np.mean(groups[k])), 4), "sd": round(float(np.std(groups[k], ddof=1)), 4)} for k in ("A", "B")]
+    rows = [{"arm": k, "n": n, "mean": round(m, 4), "sd": round(math.sqrt(v), 4)}
+            for k, n, m, v in (("A", na, ma, va), ("B", nb, mb, vb))]
     return {"summary": f"B 相对 A 平均节拍缩短 {diff:.3f} 秒；{confidence*100:g}% 区间为 [{low:.3f}, {high:.3f}] 秒。",
             "metrics": [{"label": "改善量 A−B", "value": round(diff, 5), "unit": "秒"}, {"label": "双侧 p 值", "value": float(f"{p:.6g}")}, {"label": "Cohen d", "value": round(effect, 5)}, {"label": "Welch 自由度", "value": round(df, 3)}],
             "table": {"columns": [{"key": "arm", "label": "实验组"}, {"key": "n", "label": "片段数"}, {"key": "mean", "label": "均值/秒"}, {"key": "sd", "label": "样本标准差/秒"}], "rows": rows},
             "chart": {"type": "bar", "labels": ["A 原动作", "B 改动作"], "series": [{"name": "平均单件节拍/秒", "values": [round(ma, 4), round(mb, 4)]}]},
             "findings": [f"区间下界 {low:.4f} 秒，上界 {high:.4f} 秒；{'区间未跨 0' if low > 0 or high < 0 else '区间跨 0'}。", f"t={statistic:.4f}，自由度={df:.3f}；分析班次：{shift}。", "仅在分组随机、片段独立的前提下支持实验推断；扩大试验仍须核查质检指标。"], "method": metadata()["method"], "warnings": ["班次子组比较为探索性分析，未调整多重检验。"]}
+
+
+def analyze_batches(batch_iter, params):
+    """流式版本：batch_iter 逐批产出已入库的 (arm, shift, seconds) 规格化行。
+
+    只保留 Welford 聚合量，内存不随总行数增长。片段号唯一性由解析期全量
+    去重保证，与 analyze() 对整份记录的计算口径一致。
+    """
+    confidence, shift = _validate_params(params)
+    moments = {"A": Moments(), "B": Moments()}
+    for batch in batch_iter:
+        for arm, row_shift, seconds in batch:
+            if shift == "全部" or row_shift == shift:
+                moments[arm].add(seconds)
+    a, b = moments["A"], moments["B"]
+    if min(a.n, b.n) < 3:
+        raise ValueError("每组至少需要 3 个独立实验片段")
+    return _report(a.mean, b.mean, a.var, b.var, a.n, b.n, confidence, shift)

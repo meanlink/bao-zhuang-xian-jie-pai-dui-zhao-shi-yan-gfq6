@@ -5,7 +5,8 @@ from redis import Redis
 from src.config.database import Session
 from src.config.settings import REDIS_URL
 from src.models import Job, Dataset, Report
-from src.services.business import analyze
+from src.services.business import analyze, analyze_batches
+from src.services import uploads
 from src.services.reports import deliver
 from src.services.audit import record
 logging.basicConfig(level=logging.INFO)
@@ -16,7 +17,13 @@ def execute(job_id):
         j.status='running'; db.commit()
         try:
             d=db.get(Dataset,j.dataset_id)
-            result=analyze(d.records,j.params)
+            if not d or d.status != 'ready':
+                raise ValueError('数据批次尚未解析完成或不可用')
+            if d.upload_id:
+                # 大文件批次：按 seq 键集分批读取，内存不随总量增长
+                result=analyze_batches(uploads.iter_row_batches(db,d.id),j.params)
+            else:
+                result=analyze(d.records,j.params)
             json.dumps(result,allow_nan=False)
             j.result=result;j.status='completed';j.finished_at=time.time()
             record(db,'worker','job.completed',{'id':j.id})
@@ -29,6 +36,11 @@ def tick():
     with Session() as db:
         queued=list(db.scalars(select(Job.id).where(Job.status=='queued').limit(3)))
     for job_id in queued:execute(job_id)
+    with Session() as db:
+        for upload_id in uploads.resume_candidates(db):
+            try: uploads.run_parse(upload_id)
+            except Exception: logging.exception('Upload resume failed')
+        if int(time.time()) % 3600 < 2: uploads.cleanup_finished(db)
     with Session() as db:
         for r in db.scalars(select(Report).where(Report.enabled==True,Report.next_run<=time.time())):
             d=deliver(db,r)
